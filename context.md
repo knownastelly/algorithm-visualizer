@@ -1,0 +1,9 @@
+- Use MCP to inspect the Studio Explorer layout for existing systems, redundancies, asset placement, and confirmation of structure.
+- This project uses typed Luau (`--!strict`) in all scripts unless explicitly stated otherwise.
+- No frameworks are allowed (e.g. Knit, Flamework, Aero, or similar).
+- Systems are implemented as plain ModuleScripts exporting typed singleton tables.
+- Singleton modules represent one authoritative system and must not create multiple instances unless explicitly designed to do so.
+- Explicit `require` calls only; no string-based lookups, service registries, or dynamic resolution.
+- Server and client logic must remain strictly separated.
+- No side effects are allowed at require-time (no connections, no state mutation, no execution).
+- All system startup and wiring must occur via explicit initialization functions (e.g. `Init`, `Start`, `Setup`)
