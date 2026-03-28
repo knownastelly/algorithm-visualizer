@@ -3,8 +3,9 @@
 local TweenService = game:GetService("TweenService")
 local Workspace = game:GetService("Workspace")
 
--- I keep the shared type shapes near the top because this script passes structured data through
--- several layers. Having the shapes visible first makes the rest of the code easier to read.
+-- These type definitions are here first so the rest of the file is easier to follow.
+-- In simple terms: they describe the shape of the data that moves through the system.
+-- The same data is passed between the generator, sorter, recorder, renderer, and playback code.
 
 type DatasetPattern = "Random" | "NearlySorted" | "Reversed" | "FewUnique"
 type PlaybackState = "Preparing" | "Playing" | "Paused" | "Completed"
@@ -113,17 +114,22 @@ local COLORS = {
 	BoardAccent = Color3.fromRGB(71, 148, 255),
 }
 
---Because the submission requests a single Luau file, this script is purposefully self-contained.
---Nevertheless, I divided everything into distinct pieces to make the tasks simple to understand.
---The recorder records the decisions made by the algorithm, utility code manages shared data operations,
---The playback controller graphically recreates the run, whereas the renderer owns Roblox instances.
---This division satisfies the one-script criteria while maintaining the file's readability.
+-- This file is self-contained because the submission requires one Luau script.
+-- Even though it is one file, I still split the logic into clear sections:
+-- 1. data generation
+-- 2. metric tracking
+-- 3. step recording
+-- 4. sorting
+-- 5. phyiscal rendering
+-- 6. playback
+-- I did that so each part has one job and the reader can understand the flow in order.
 
 local Utility = {}
 
 function Utility.CloneArray(values: { number }): { number }
-	-- I clone arrays at the boundaries between systems so the generator, sorter, recorder, and
-	-- renderer are not all mutating the same table reference behind each other's backs.
+	-- This makes a copy of an array.
+	-- I do this so one part of the script does not accidentally change data that another part is
+	-- still relying on.
 	local clone = table.create(#values)
 
 	for index, value in values do
@@ -141,28 +147,31 @@ local RANDOM_MULTIPLIER = 1103515245
 local RANDOM_INCREMENT = 12345
 
 function SeededRandom.new(seed: number)
+	-- A seed means "start the random sequence from this exact point".
+	-- That lets me recreate the same dataset later instead of getting a different one every time.
 	return setmetatable({
 		_state = math.floor(seed) % RANDOM_MODULUS,
 	}, SeededRandom)
 end
 
 function SeededRandom:NextNumber(): number
-	-- Using a local seeded generator keeps datasets reproducible across runs.
+	-- This moves the internal random state forward and returns a number between 0 and 1.
+	-- The important part is that the sequence stays repeatable for the same seed.
 	self._state = ((self._state * RANDOM_MULTIPLIER) + RANDOM_INCREMENT) % RANDOM_MODULUS
 	return self._state / RANDOM_MODULUS
 end
 
 function SeededRandom:NextInteger(minimum: number, maximum: number): number
-	-- The rest of the script only needs integer values for bar heights, so I keep the public API of
-	-- the generator small and purpose-built.
+	-- The visualizer needs whole numbers for bar heights, so this converts the random decimal into
+	-- an integer inside the requested range.
 	return math.floor(self:NextNumber() * ((maximum - minimum) + 1)) + minimum
 end
 
 local DataGenerator = {}
 
 local function buildRandomDataset(size: number, seed: number): { number }
-	-- Dataset generation is isolated from the sorting logic. I want to be able to change the input
-	-- pattern without touching quicksort itself.
+	-- This creates the starting list of numbers.
+	-- It is kept separate from quicksort so I can change the input data without changing the sorting code.
 	local randomStream = SeededRandom.new(seed)
 	local values = table.create(size)
 
@@ -174,13 +183,12 @@ local function buildRandomDataset(size: number, seed: number): { number }
 end
 
 local function applyNearlySorted(values: { number })
-	-- "Nearly sorted" is useful because it still looks mostly ordered to the eye, which makes the
-	-- few remaining disruptions easy to watch as the algorithm resolves them.
+	-- This turns a sorted list into a list that is "almost" sorted.
+	-- I use it because it makes the mistakes easy to spot with your eyes.
 	local swapCount = math.max(1, math.floor(#values * 0.14))
 
 	for offset = 1, swapCount do
-		-- Swapping nearby values keeps the dataset close to sorted instead of turning it back into
-		-- visual noise.
+		-- I only disturb nearby positions, so the list still looks mostly ordered.
 		local a = math.max(1, math.min(#values - 1, offset * 2))
 		local b = a + 1
 		values[a], values[b] = values[b], values[a]
@@ -188,8 +196,8 @@ local function applyNearlySorted(values: { number })
 end
 
 local function applyFewUnique(values: { number })
-	-- Reusing only a handful of values creates visible height clusters. That makes partition behavior
-	-- easier to notice than on a completely random skyline.
+	-- This forces many bars to share the same few heights.
+	-- That makes groups and duplicates easier to notice during the quicksort run.
 	local distinctValues = {
 		MIN_VALUE,
 		math.floor((MIN_VALUE + MAX_VALUE) * 0.5),
@@ -204,16 +212,16 @@ end
 function DataGenerator.Generate(size: number, pattern: DatasetPattern, seed: number): { number }
 	assert(size > 1, "Dataset size must be greater than 1")
 
-	-- Every run begins from a deterministic seed, then branches into a specific input shape. That
-	-- lets me talk about the effect of the pattern independently from the effect of the algorithm.
+	-- This is the main entry point for building the dataset.
+	-- First I make the base numbers, then I shape them into the pattern I want to demonstrate.
 	local values = buildRandomDataset(size, seed)
 
 	if pattern == "Random" then
 		return values
 	end
 
-	-- For the non-random cases I sort first, then reshape the data into a controlled scenario. That
-	-- gives each pattern a clear baseline instead of layering randomness on top of randomness.
+	-- For the non-random patterns, I start from a sorted version first.
+	-- That gives me a clean base before I turn it into "nearly sorted", "reversed", or "few unique".
 	table.sort(values)
 
 	if pattern == "NearlySorted" then
@@ -226,8 +234,8 @@ function DataGenerator.Generate(size: number, pattern: DatasetPattern, seed: num
 		applyFewUnique(values)
 	end
 
-	-- The generated array is returned as-is and never touched again by this section. From this point
-	-- forward, ownership moves to the sorting and recording phase.
+	-- After this point, dataset creation is finished.
+	-- The sorting code receives the result and takes over from there.
 	return values
 end
 
@@ -235,8 +243,8 @@ local MetricsTracker = {}
 MetricsTracker.__index = MetricsTracker
 
 function MetricsTracker.new()
-	-- Metrics live behind a small metatable-based object so quicksort can describe what happened
-	-- through focused method calls rather than directly poking fields all over the place.
+	-- This object stores counters like comparisons, swaps, and reads.
+	-- I wrapped them in methods so the sorting code can say what happened in plain terms.
 	return setmetatable({
 		_comparisons = 0,
 		_swaps = 0,
@@ -251,12 +259,12 @@ function MetricsTracker.new()
 end
 
 local function incrementMetric(self: any, fieldName: string, amount: number?)
-	-- Centralizing the "increment by one or by amount" behavior keeps the metric methods uniform.
+	-- All the metric increment methods work the same way, so this helper keeps that logic in one place.
 	self[fieldName] += amount or 1
 end
 
 function MetricsTracker:Reset(arraySize: number)
-	-- Resetting before each run prevents earlier demos from polluting the numbers shown on the board.
+	-- This clears the old counters so each demo run starts from zero.
 	self._comparisons = 0
 	self._swaps = 0
 	self._reads = 0
@@ -301,7 +309,8 @@ function MetricsTracker:SetExecutionTimeSeconds(seconds: number)
 end
 
 function MetricsTracker:GetSnapshot(): MetricsSnapshot
-	-- I expose a plain snapshot here instead of the tracker itself because the renderer only needs read-only values for display.
+	-- The renderer only needs a plain copy of the numbers to display on the board.
+	-- It does not need direct control over the tracker object itself.
 	return {
 		comparisons = self._comparisons,
 		swaps = self._swaps,
@@ -319,9 +328,9 @@ local StepRecorder = {}
 StepRecorder.__index = StepRecorder
 
 function StepRecorder.new(initialValues: { number }, pattern: DatasetPattern, seed: number, metricsTracker: any)
-	-- The recorder is the bridge between the algorithm and the visual playback. The sort runs once,
-	-- records the important decisions it made, and the playback layer later turns those decisions
-	-- into motion.
+	-- This recorder is the bridge between "sorting the data" and "showing the sorting visually".
+	-- The algorithm runs once and stores the important moments it went through.
+	-- Later, playback reads those saved moments and turns them into animation.
 	return setmetatable({
 		_initialValues = Utility.CloneArray(initialValues),
 		_steps = {} :: { VisualizationStep },
@@ -338,15 +347,15 @@ function StepRecorder.new(initialValues: { number }, pattern: DatasetPattern, se
 end
 
 function StepRecorder:Record(step: VisualizationStep)
-	-- Steps are semantic on purpose. I record ideas like "compare these indices" or "mark this pivot"
-	-- instead of raw property changes so the playback code stays expressive.
+	-- I save meaningful actions here, not raw Part changes.
+	-- For example: "compare these two bars" is more useful than "change this color right now".
 	table.insert(self._steps, step)
 	self._metricsTracker:IncrementTotalSteps(1)
 end
 
 function StepRecorder:CommitSnapshot(values: { number })
-	-- I only snapshot every few steps because recording the whole array after every operation would
-	-- cost more memory than the visualizer actually needs.
+	-- Every so often I save a full copy of the array.
+	-- This is useful for jumping backward later without having to replay the entire sort from step 1.
 	if (#self._steps % SNAPSHOT_INTERVAL) ~= 0 then
 		return
 	end
@@ -358,8 +367,8 @@ function StepRecorder:CommitSnapshot(values: { number })
 end
 
 function StepRecorder:Finish(finalValues: { number }): Recording
-	-- The completed recording contains enough information to reset, replay, inspect, and label the
-	-- run without needing to execute the algorithm a second time.
+	-- This packages everything the playback system needs:
+	-- the original values, the final values, the saved steps, a few snapshots, and some metadata.
 	return {
 		initialValues = Utility.CloneArray(self._initialValues),
 		finalValues = Utility.CloneArray(finalValues),
@@ -376,9 +385,10 @@ end
 local QuickSort = {}
 
 local function partition(values: { number }, recorder: any, metrics: any, low: number, high: number): number
-	-- Partition is the heart of this visualizer because it is where quicksort's decision-making is
-	-- easiest to see. I highlight the active range, identify the pivot, and then show how each value
-	-- is judged relative to that pivot.
+	-- This is the most important part of quicksort.
+	-- The last value is used as the pivot.
+	-- Then the code scans the current range from left to right and pushes smaller values toward the front.
+	-- This is also the easiest part to visualize, so I record a lot of detail here.
 	local pivotValue = values[high]
 	local smallerIndex = low - 1
 
@@ -396,8 +406,8 @@ local function partition(values: { number }, recorder: any, metrics: any, low: n
 	})
 
 	for index = low, high - 1 do
-		-- Every iteration here represents one comparison between the current candidate and the pivot.
-		-- That is why comparisons and reads are incremented in the same block.
+		-- Here I compare the current value to the pivot.
+		-- If the current value belongs on the "smaller than pivot" side, I move it left.
 		recorder:Record({
 			type = "compare",
 			indexA = index,
@@ -410,7 +420,8 @@ local function partition(values: { number }, recorder: any, metrics: any, low: n
 			smallerIndex += 1
 
 			if smallerIndex ~= index then
-				-- I only record swaps that actually move data. Skipping no-op swaps keeps both the metrics and the playback more honest.
+				-- I only record real swaps.
+				-- If both positions are already the same slot, there is no visible move to show.
 				values[smallerIndex], values[index] = values[index], values[smallerIndex]
 				recorder:Record({
 					type = "swap",
@@ -425,8 +436,8 @@ local function partition(values: { number }, recorder: any, metrics: any, low: n
 	end
 
 	local pivotIndex = smallerIndex + 1
-	-- Once the pivot is moved into place, that slot is final for the rest of the algorithm. I mark it
-	-- sorted immediately so the viewer can see progress accumulate.
+	-- After the scan is done, the pivot is moved into its final correct position.
+	-- Once that happens, quicksort will never move that pivot again.
 	values[pivotIndex], values[high] = values[high], values[pivotIndex]
 	recorder:Record({
 		type = "swap",
@@ -450,8 +461,8 @@ local function partition(values: { number }, recorder: any, metrics: any, low: n
 end
 
 local function quickSort(values: { number }, recorder: any, metrics: any, low: number, high: number, depth: number)
-	-- The recursive wrapper mostly exists to manage bounds and recursion depth. I kept it small so
-	-- the core partition logic remains the main thing being explained.
+	-- This function keeps splitting the problem into smaller pieces.
+	-- First it solves one partition, then it repeats the same idea on the left side and the right side.
 	if low > high then
 		return
 	end
@@ -459,8 +470,8 @@ local function quickSort(values: { number }, recorder: any, metrics: any, low: n
 	metrics:PushRecursionDepth(depth)
 
 	if low == high then
-		-- A one-element slice is already solved, so I record that explicitly to make the playback feel
-		-- complete rather than silently skipping the leaf case.
+		-- A section with one value is already sorted.
+		-- I still record it so the playback can show that this branch is finished.
 		recorder:Record({
 			type = "markSorted",
 			index = low,
@@ -469,14 +480,14 @@ local function quickSort(values: { number }, recorder: any, metrics: any, low: n
 	end
 
 	local pivotIndex = partition(values, recorder, metrics, low, high)
-	-- After partitioning, the remaining work naturally splits into the left and right subranges.
+	-- After the pivot is fixed, everything left of it and right of it is handled separately.
 	quickSort(values, recorder, metrics, low, pivotIndex - 1, depth + 1)
 	quickSort(values, recorder, metrics, pivotIndex + 1, high, depth + 1)
 end
 
 function QuickSort.Run(inputValues: { number }, pattern: DatasetPattern, seed: number): (Recording, MetricsSnapshot)
-	-- I sort a cloned working array so the recording still knows what the original unsorted dataset
-	-- looked like when playback wants to reset.
+	-- I sort a copy instead of the original array.
+	-- That way the playback system can still remember what the unsorted starting state looked like.
 	local workingValues = Utility.CloneArray(inputValues)
 	local metrics = MetricsTracker.new()
 	metrics:Reset(#workingValues)
@@ -484,8 +495,9 @@ function QuickSort.Run(inputValues: { number }, pattern: DatasetPattern, seed: n
 	local recorder = StepRecorder.new(workingValues, pattern, seed, metrics)
 	local startTime = os.clock()
 
-	-- Recording and playback are two separate phases. The algorithm finishes its real work here,
-	-- and the renderer only reenacts that history afterward.
+	-- Important detail: the actual sorting work happens here first.
+	-- The on-screen animation does not happen yet.
+	-- The animation comes later by replaying the saved steps.
 	quickSort(workingValues, recorder, metrics, 1, #workingValues, 1)
 	recorder:Record({
 		type = "done",
@@ -500,8 +512,8 @@ local BarRenderer = {}
 BarRenderer.__index = BarRenderer
 
 function BarRenderer.new()
-	-- The renderer owns every Roblox instance used by the demonstration. That includes the platform,
-	-- the bars, the range highlight, and the status board.
+	-- This object is responsible for everything the player can see in the demo.
+	-- That includes the floor platform, the bars, the range box, and the text board.
 	return setmetatable({
 		_container = nil :: Folder?,
 		_platform = nil :: Part?,
@@ -520,7 +532,7 @@ function BarRenderer.new()
 end
 
 local function getOrCreateFolder(name: string, parent: Instance): Folder
-	-- Grouping generated instances into one folder keeps Explorer tidy and makes it obvious which objects belong to the demo.
+	-- This keeps all generated objects inside one folder so the demo stays organized in Explorer.
 	local folder = parent:FindFirstChild(name)
 	if folder == nil then
 		folder = Instance.new("Folder")
@@ -549,13 +561,14 @@ local function createLabel(name: string, order: number, height: number, textSize
 end
 
 function BarRenderer:Init()
-	-- The whole installation is anchored to one fixed world-space center. That keeps the visualizer
-	-- stable across resets and makes the placement math much easier to trust.
+	-- This sets up the 3D area where the visualizer lives.
+	-- I keep it in one fixed place so every rerun uses the same layout.
 	self._container = getOrCreateFolder(CONTAINER_NAME, Workspace)
 
 	local platform = self._container:FindFirstChild(PLATFORM_NAME) :: Part?
 	if platform == nil then
-		-- The platform acts as the floor and as the physical reference point for everything else.
+		-- The platform is the floor under the bars.
+		-- It also gives me one stable object to measure everything else from.
 		platform = Instance.new("Part")
 		platform.Name = PLATFORM_NAME
 		platform.Anchored = true
@@ -578,7 +591,9 @@ end
 function BarRenderer:_ensureStatusBoard()
 	assert(self._container ~= nil and self._platform ~= nil, "Renderer must be initialized before creating UI")
 
-	-- The board is attached to an invisible anchor part so I can position it in 3D space using CFrame while letting BillboardGui handle readability.
+	-- The text board is attached to an invisible part.
+	-- I do that so I can place it in 3D space with normal CFrame math, while BillboardGui keeps the
+	-- text facing the camera.
 	local boardPart = self._container:FindFirstChild(STATUS_BOARD_NAME) :: Part?
 	if boardPart == nil then
 		boardPart = Instance.new("Part")
@@ -677,7 +692,8 @@ end
 
 function BarRenderer:_calcBarPosition(index: number, count: number, height: number): Vector3
 	local basePosition = self:_calcXPosition(index, count)
-	-- Roblox positions parts from the center, so I add half the height to keep each bar sitting on the same floor line.
+	-- Roblox places a Part by its center, not by its bottom.
+	-- So I add half the bar height here to stop the bar from sinking into the floor.
 	return basePosition + Vector3.new(0, height * 0.5, 0)
 end
 
@@ -815,7 +831,8 @@ function BarRenderer:UpdateStatus(state: PlaybackState, metadata: RecordingMetad
 end
 
 function BarRenderer:HighlightCompare(indexA: number, indexB: number)
-	-- Comparison highlighting communicates inspection without movement.
+	-- Comparing two values should not move them.
+	-- I only change their color here so the viewer knows which bars are being checked.
 	self:GetBar(indexA).Color = COLORS.Compare
 	self:GetBar(indexB).Color = COLORS.Compare
 end
@@ -824,11 +841,13 @@ function BarRenderer:SwapBars(indexA: number, indexB: number)
 	local barA = self:GetBar(indexA)
 	local barB = self:GetBar(indexB)
 
-	-- Keep the index-to-bar mapping as the source of truth during swaps.
+	-- First I swap the mapping.
+	-- This means "the bar that used to belong to slot A now belongs to slot B", and vice versa.
 	self._indexToBar[indexA] = barB
 	self._indexToBar[indexB] = barA
 
-	-- Each bar is tweened to the position that matches its own height so the bases stay grounded.
+	-- Then I move the physical bars to match the new mapping.
+	-- I recalculate each destination using that bar's own height so the base stays on the floor.
 	self:_tweenBar(barA, nil, self:_calcBarPosition(indexB, self._barCount, barA.Size.Y))
 	self:_tweenBar(barB, nil, self:_calcBarPosition(indexA, self._barCount, barB.Size.Y))
 
@@ -845,7 +864,8 @@ end
 function BarRenderer:ShowRange(startIndex: number, endIndex: number)
 	self:HideRange()
 
-	-- The range highlight makes recursion visible by showing which slice is currently being worked on.
+	-- Quicksort only works on one slice of the array at a time.
+	-- This white box shows which section is currently active.
 	local firstBar = self:GetBar(startIndex)
 	local lastBar = self:GetBar(endIndex)
 	local width = math.abs(lastBar.Position.X - firstBar.Position.X) + BAR_WIDTH + 1
@@ -932,7 +952,8 @@ function PlaybackController:SetSpeed(multiplier: number)
 end
 
 function PlaybackController:Load(recording: Recording, metrics: MetricsSnapshot)
-	-- Loading a recording rewinds the visualizer to the original unsorted state before any steps are replayed.
+	-- This loads a finished recording and resets the visualizer back to the unsorted starting point.
+	-- Nothing is animated yet. It just prepares the replay.
 	self._recording = recording
 	self._metrics = metrics
 	self._currentStepIndex = 0
@@ -948,7 +969,8 @@ function PlaybackController:StepForward(): boolean
 		return false
 	end
 
-	-- Playback consumes one semantic step at a time and translates it back into renderer actions.
+	-- Playback reads one saved step and turns it back into visible behavior.
+	-- In other words, this is the function that turns "recorded sort history" into animation.
 	if self._currentStepIndex >= #self._recording.steps then
 		self._state = "Completed"
 		self._renderer:UpdateStatus(self._state, self._recording.metadata, self._metrics, self._currentStepIndex, #self._recording.steps)
@@ -959,7 +981,9 @@ function PlaybackController:StepForward(): boolean
 	local step = self._recording.steps[self._currentStepIndex]
 	self._renderer:ResetColors()
 
-	-- This dispatch is intentionally explicit so the relationship between recorded events and visual behavior stays obvious.
+	-- Each step type means a different visual action.
+	-- I keep this explicit on purpose so the connection between the saved step and the on-screen
+	-- result is easy to read.
 	if step.type == "compare" then
 		self._renderer:HighlightCompare(step.indexA, step.indexB)
 	elseif step.type == "swap" then
@@ -989,7 +1013,8 @@ function PlaybackController:Play()
 		return
 	end
 
-	-- Guard against overlapping playback loops from older runs.
+	-- If a new run starts while an older one is still playing, the older one should stop.
+	-- This run id is a simple way to make sure only the newest playback loop stays alive.
 	self._runId += 1
 	local activeRunId = self._runId
 	self._state = "Playing"
@@ -1014,7 +1039,10 @@ function PlaybackController:Play()
 end
 
 local function prepareDemo(playback: any, seed: number, pattern: DatasetPattern)
-	-- One demo cycle always follows the same path: generate data, record the sort, then replay it.
+	-- This is one full demo cycle:
+	-- 1. build the dataset
+	-- 2. record the quicksort run
+	-- 3. play the saved steps on screen
 	local values = DataGenerator.Generate(DEFAULT_SIZE, pattern, seed)
 	local recording, metrics = QuickSort.Run(values, pattern, seed)
 	playback:Load(recording, metrics)
